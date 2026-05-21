@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metric-terminal"
+version = "0.1.0"
+description = "View metrics and graphs with ASCII art in your terminal"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+keywords = ["metrics", "terminal", "ascii", "charts", "visualization"]
+dependencies = ["plotext>=5.0"]
+
+[project.optional-dependencies]
+tensorboard = ["tbparse>=0.0.7"]
+all = ["tbparse>=0.0.7"]
+
+[project.scripts]
+metric-terminal = "metric_terminal.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/blythed/metric_terminal"
+Repository = "https://github.com/blythed/metric_terminal"
+
+[tool.setuptools.packages.find]
+where = ["."]
