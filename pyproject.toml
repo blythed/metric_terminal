@@ -24,10 +24,6 @@ classifiers = [
 keywords = ["metrics", "terminal", "ascii", "charts", "visualization"]
 dependencies = ["plotext>=5.0"]
 
-[project.optional-dependencies]
-tensorboard = ["tbparse>=0.0.7"]
-all = ["tbparse>=0.0.7"]
-
 [project.scripts]
 metric-terminal = "metric_terminal.cli:main"
 

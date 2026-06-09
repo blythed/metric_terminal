@@ -1,14 +1,115 @@
-"""JSONL and TensorBoard log parsing."""
+"""JSONL log parsing."""
 
 import json
-import os
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator, TextIO
 
 # Common x-axis field names in order of preference
-X_AXIS_CANDIDATES = ['step', 'iteration', 'iter', 'epoch', 'count', 'i', 't', 'x']
+X_AXIS_CANDIDATES = [
+    'step', 'iteration', 'iter', 'epoch', 'count',
+    'ts', 'time', 'timestamp', 'datetime',
+    'i', 't', 'x',
+]
+
+_TIMESTAMP_FORMATS = (
+    '%Y/%m/%d %H:%M:%S.%f',
+    '%Y/%m/%d %H:%M:%S',
+    '%Y-%m-%d %H:%M:%S.%f',
+    '%Y-%m-%d %H:%M:%S',
+    '%Y/%m/%dT%H:%M:%S.%f',
+    '%Y/%m/%dT%H:%M:%S',
+)
+
+
+def parse_timestamp(value) -> float | None:
+    """Convert a value to epoch seconds. Returns None if not parseable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        pass
+    for fmt in _TIMESTAMP_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_epoch(series: dict) -> dict:
+    """If x-values look like epoch seconds, rebase them to seconds-from-start."""
+    all_x = []
+    for value in series.values():
+        if isinstance(value, dict):
+            for xs, _ in value.values():
+                all_x.extend(xs)
+        else:
+            xs, _ = value
+            all_x.extend(xs)
+    if not all_x or min(all_x) <= 1e9:
+        return series
+    base = min(all_x)
+    for key, value in series.items():
+        if isinstance(value, dict):
+            for gk, (xs, ys) in value.items():
+                value[gk] = ([x - base for x in xs], ys)
+        else:
+            xs, ys = value
+            series[key] = ([x - base for x in xs], ys)
+    return series
+
+
+def _clip_pair(xs: list[float], ys: list[float], xmin, xmax):
+    """Keep only points whose x falls within [xmin, xmax] (either bound optional)."""
+    out_x, out_y = [], []
+    for x, y in zip(xs, ys):
+        if xmin is not None and x < xmin:
+            continue
+        if xmax is not None and x > xmax:
+            continue
+        out_x.append(x)
+        out_y.append(y)
+    return out_x, out_y
+
+
+def clip_x_range(series: dict, xmin: float | None = None, xmax: float | None = None) -> dict:
+    """
+    Restrict a series or panel dict to an x-axis window.
+
+    Accepts both flat ({name: (xs, ys)}) and nested
+    ({tag: {run: (xs, ys)}}) shapes, mirroring the other helpers here.
+    Returns a new dict; empty series are dropped.
+    """
+    if xmin is None and xmax is None:
+        return series
+
+    clipped: dict = {}
+    for key, value in series.items():
+        if isinstance(value, dict):
+            inner = {}
+            for gk, (xs, ys) in value.items():
+                cx, cy = _clip_pair(xs, ys, xmin, xmax)
+                if cx:
+                    inner[gk] = (cx, cy)
+            if inner:
+                clipped[key] = inner
+        else:
+            xs, ys = value
+            cx, cy = _clip_pair(xs, ys, xmin, xmax)
+            if cx:
+                clipped[key] = (cx, cy)
+    return clipped
 
 
 def smooth_values(values: list[float], weight: float) -> list[float]:
@@ -32,185 +133,6 @@ def smooth_values(values: list[float], weight: float) -> list[float]:
         last = weight * last + (1 - weight) * v
         smoothed.append(last)
     return smoothed
-
-
-def compute_stats(steps: list[float], values: list[float]) -> dict:
-    """
-    Compute statistics for a series.
-
-    Returns dict with: current, start, min, max, mean, change_pct,
-    recent_change_pct, trend, steps
-    """
-    if not values:
-        return {}
-
-    n = len(values)
-    current = values[-1]
-    start = values[0]
-    min_val = min(values)
-    max_val = max(values)
-    min_step = steps[values.index(min_val)]
-    max_step = steps[values.index(max_val)]
-    mean_val = sum(values) / n
-
-    # Change from start
-    if start != 0:
-        change_pct = ((current - start) / abs(start)) * 100
-    else:
-        change_pct = 0.0 if current == 0 else float('inf')
-
-    # Recent change (last 10% of data or at least 10 points)
-    recent_n = max(10, n // 10)
-    if n > recent_n:
-        recent_start = values[-recent_n]
-        if recent_start != 0:
-            recent_change_pct = ((current - recent_start) / abs(recent_start)) * 100
-        else:
-            recent_change_pct = 0.0
-    else:
-        recent_change_pct = change_pct
-
-    # Trend detection based on recent slope
-    if n >= 10:
-        recent_vals = values[-min(recent_n, n):]
-        # Simple linear regression slope
-        x_mean = (len(recent_vals) - 1) / 2
-        y_mean = sum(recent_vals) / len(recent_vals)
-        numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(recent_vals))
-        denominator = sum((i - x_mean) ** 2 for i in range(len(recent_vals)))
-        slope = numerator / denominator if denominator != 0 else 0
-
-        # Normalize slope by mean to get relative change
-        if y_mean != 0:
-            rel_slope = slope / abs(y_mean)
-        else:
-            rel_slope = 0
-
-        if abs(recent_change_pct) < 1:
-            trend = 'plateau'
-        elif rel_slope > 0.001:
-            trend = 'increasing'
-        elif rel_slope < -0.001:
-            trend = 'decreasing'
-        else:
-            trend = 'plateau'
-    else:
-        trend = 'insufficient_data'
-
-    return {
-        'current': current,
-        'start': start,
-        'min': {'value': min_val, 'step': min_step},
-        'max': {'value': max_val, 'step': max_step},
-        'mean': mean_val,
-        'change_pct': round(change_pct, 1),
-        'recent_change_pct': round(recent_change_pct, 1),
-        'trend': trend,
-        'steps': n,
-    }
-
-
-def is_tensorboard_dir(path: str) -> bool:
-    """Check if path is a TensorBoard log directory."""
-    if not os.path.isdir(path):
-        return False
-    # Look for tfevents files
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            if 'tfevents' in f:
-                return True
-    return False
-
-
-def is_tensorboard_file(path: str) -> bool:
-    """Check if path is a TensorBoard event file."""
-    return os.path.isfile(path) and 'tfevents' in os.path.basename(path)
-
-
-def parse_tensorboard(
-    path: str,
-    tags: list[str] | None = None,
-    run_name: str | None = None,
-) -> dict[str, dict[str, tuple[list[float], list[float]]]]:
-    """
-    Parse TensorBoard logs and return series data grouped by tag.
-
-    Args:
-        path: Path to TensorBoard log directory or event file
-        tags: Optional list of specific tags to extract
-        run_name: Optional name for this run (used when comparing multiple experiments)
-
-    Returns:
-        Dict mapping tag name to dict of {run_name: (steps, values)}
-        This allows multiple runs to be overlaid per metric.
-    """
-    try:
-        from tbparse import SummaryReader
-    except ImportError:
-        raise ImportError(
-            "tbparse is required for TensorBoard support. "
-            "Install with: pip install tbparse"
-        )
-
-    reader = SummaryReader(path, extra_columns={'dir_name'})
-    df = reader.scalars
-
-    if df.empty:
-        return {}
-
-    available_tags = df['tag'].unique()
-
-    # Filter to requested tags if specified
-    if tags:
-        target_tags = [t for t in tags if t in available_tags]
-    else:
-        target_tags = list(available_tags)
-
-    # Group by tag, then by run (dir_name)
-    result = {}
-    for tag in target_tags:
-        tag_df = df[df['tag'] == tag]
-        runs = tag_df['dir_name'].unique()
-
-        tag_series = {}
-        for run in runs:
-            run_df = tag_df[tag_df['dir_name'] == run].sort_values('step')
-            steps = run_df['step'].tolist()
-            values = run_df['value'].tolist()
-            if steps:
-                # Determine run label
-                if run_name:
-                    # Use provided run name, append subdir if present
-                    label = f"{run_name}/{run}" if run else run_name
-                else:
-                    label = run if run else 'default'
-                tag_series[label] = (steps, values)
-
-        if tag_series:
-            result[tag] = tag_series
-
-    return result
-
-
-def merge_tensorboard_panels(
-    *panel_dicts: dict[str, dict[str, tuple[list[float], list[float]]]]
-) -> dict[str, dict[str, tuple[list[float], list[float]]]]:
-    """
-    Merge multiple panel dicts from different TensorBoard directories.
-
-    Args:
-        panel_dicts: Multiple dicts from parse_tensorboard()
-
-    Returns:
-        Merged dict with all runs combined per tag
-    """
-    merged = {}
-    for panels in panel_dicts:
-        for tag, runs in panels.items():
-            if tag not in merged:
-                merged[tag] = {}
-            merged[tag].update(runs)
-    return merged
 
 
 def parse_jsonl(
@@ -277,11 +199,10 @@ def detect_x_axis(records: list[dict]) -> str | None:
     for record in records[1:]:
         common_fields &= set(record.keys())
 
-    # Check candidates in order of preference
+    # Check candidates in order of preference (numeric or timestamp strings)
     for candidate in X_AXIS_CANDIDATES:
         if candidate in common_fields:
-            # Verify it contains numeric values
-            if all(isinstance(r.get(candidate), (int, float)) for r in records):
+            if all(parse_timestamp(r.get(candidate)) is not None for r in records):
                 return candidate
 
     # Fallback: find any numeric field that looks like an index
@@ -331,12 +252,100 @@ def extract_series(
         x_values = []
         y_values = []
         for record in records:
-            x = record.get(x_axis)
+            x = parse_timestamp(record.get(x_axis))
             y = record.get(field)
-            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
-                x_values.append(float(x))
+            if x is not None and isinstance(y, (int, float)) and not isinstance(y, bool):
+                x_values.append(x)
                 y_values.append(float(y))
         if x_values:
             series[field] = (x_values, y_values)
 
-    return series
+    return _normalize_epoch(series)
+
+
+def extract_grouped_series(
+    records: list[dict],
+    x_axis: str,
+    y_fields: list[str] | None,
+    group_by: str,
+) -> dict[str, dict[str, tuple[list[float], list[float]]]]:
+    """
+    Extract series split by a categorical field.
+
+    Returns a panel-shaped dict: {y_field: {group_value: (x_values, y_values)}}
+    so each distinct value of `group_by` becomes its own curve on the y_field panel.
+    """
+    if not records:
+        return {}
+
+    if y_fields:
+        fields = y_fields
+    else:
+        sample = records[0]
+        fields = [
+            k for k, v in sample.items()
+            if k != x_axis and k != group_by
+            and isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+
+    result: dict[str, dict[str, tuple[list[float], list[float]]]] = {f: {} for f in fields}
+    for record in records:
+        x = parse_timestamp(record.get(x_axis))
+        g = record.get(group_by)
+        if x is None or g is None:
+            continue
+        g_key = f"{group_by}={g}"
+        for f in fields:
+            y = record.get(f)
+            if not isinstance(y, (int, float)) or isinstance(y, bool):
+                continue
+            bucket = result[f].setdefault(g_key, ([], []))
+            bucket[0].append(x)
+            bucket[1].append(float(y))
+
+    result = {k: v for k, v in result.items() if v}
+    return _normalize_epoch(result)
+
+
+def extract_paneled_series(
+    records: list[dict],
+    x_axis: str,
+    y_fields: list[str] | None,
+    panel_by: str,
+) -> dict[str, dict[str, tuple[list[float], list[float]]]]:
+    """
+    One panel per distinct value of `panel_by`, with each y-field as a curve inside.
+
+    Returns: {panel_value: {y_field: (x_values, y_values)}}
+    """
+    if not records:
+        return {}
+
+    if y_fields:
+        fields = y_fields
+    else:
+        sample = records[0]
+        fields = [
+            k for k, v in sample.items()
+            if k != x_axis and k != panel_by
+            and isinstance(v, (int, float)) and not isinstance(v, bool)
+        ]
+
+    result: dict[str, dict[str, tuple[list[float], list[float]]]] = {}
+    for record in records:
+        x = parse_timestamp(record.get(x_axis))
+        p = record.get(panel_by)
+        if x is None or p is None:
+            continue
+        p_key = f"{panel_by}={p}"
+        panel = result.setdefault(p_key, {})
+        for f in fields:
+            y = record.get(f)
+            if not isinstance(y, (int, float)) or isinstance(y, bool):
+                continue
+            bucket = panel.setdefault(f, ([], []))
+            bucket[0].append(x)
+            bucket[1].append(float(y))
+
+    result = {p: v for p, v in result.items() if v}
+    return _normalize_epoch(result)

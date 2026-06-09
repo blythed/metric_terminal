@@ -4,20 +4,18 @@ import argparse
 import glob
 import os
 import sys
-from pathlib import Path
-
-import json as json_module
+import threading
+import time
+from collections import deque
 
 from .parser import (
     parse_jsonl,
     detect_x_axis,
     extract_series,
-    is_tensorboard_dir,
-    is_tensorboard_file,
-    parse_tensorboard,
-    merge_tensorboard_panels,
+    extract_grouped_series,
+    extract_paneled_series,
+    clip_x_range,
     smooth_values,
-    compute_stats,
 )
 from .chart import LineChart
 from .renderers import get_renderer
@@ -32,89 +30,28 @@ def get_terminal_size() -> tuple[int, int]:
         return 80, 24
 
 
-def format_value(v: float, width: int = 12) -> str:
-    """Format a numeric value for display."""
-    if abs(v) >= 1000:
-        return f"{v:>{width},.1f}"
-    elif abs(v) >= 1:
-        return f"{v:>{width}.3f}"
-    elif abs(v) >= 0.001:
-        return f"{v:>{width}.4f}"
+def parse_xlim(value: str) -> tuple[float | None, float | None]:
+    """
+    Parse an x-axis range string into (min, max) bounds.
+
+    Accepts 'MIN:MAX' with either side optional ('0:200', ':200', '1000:'),
+    or a single value 'MAX' as shorthand for ':MAX'.
+    """
+    s = value.strip()
+    if ':' in s:
+        lo, _, hi = s.partition(':')
     else:
-        return f"{v:>{width}.2e}"
-
-
-def format_stats_table(all_stats: dict) -> str:
-    """
-    Format statistics as a table.
-
-    Single run: vertical format
-    Multiple runs: side-by-side table
-    """
-    lines = []
-
-    for tag, runs in all_stats.items():
-        run_names = list(runs.keys())
-        num_runs = len(run_names)
-
-        if num_runs == 0:
-            continue
-
-        # Determine column width based on run names
-        col_width = max(12, max(len(n) for n in run_names) + 2)
-
-        if num_runs == 1:
-            # Single run - vertical format
-            run_name = run_names[0]
-            stats = runs[run_name]
-            lines.append(f"{tag}:")
-            lines.append(f"  current:  {format_value(stats['current'])}")
-            lines.append(f"  start:    {format_value(stats['start'])}")
-            lines.append(f"  min:      {format_value(stats['min']['value'])} (step {int(stats['min']['step'])})")
-            lines.append(f"  max:      {format_value(stats['max']['value'])} (step {int(stats['max']['step'])})")
-            lines.append(f"  mean:     {format_value(stats['mean'])}")
-            lines.append(f"  change:   {stats['change_pct']:+.1f}%")
-            lines.append(f"  recent:   {stats['recent_change_pct']:+.1f}%")
-            lines.append(f"  trend:    {stats['trend']}")
-            lines.append(f"  steps:    {stats['steps']}")
-            lines.append("")
-        else:
-            # Multiple runs - side-by-side table
-            # Header
-            header = f"{tag:<20}" + "".join(f"{n:>{col_width}}" for n in run_names)
-            lines.append(header)
-
-            # Rows
-            rows = [
-                ('current', lambda s: format_value(s['current'], col_width)),
-                ('start', lambda s: format_value(s['start'], col_width)),
-                ('min', lambda s: format_value(s['min']['value'], col_width)),
-                ('max', lambda s: format_value(s['max']['value'], col_width)),
-                ('mean', lambda s: format_value(s['mean'], col_width)),
-                ('change', lambda s: f"{s['change_pct']:>{col_width-1}.1f}%"),
-                ('recent', lambda s: f"{s['recent_change_pct']:>{col_width-1}.1f}%"),
-                ('trend', lambda s: f"{s['trend']:>{col_width}}"),
-                ('steps', lambda s: f"{s['steps']:>{col_width}}"),
-            ]
-
-            for row_name, formatter in rows:
-                row = f"  {row_name:<18}"
-                for run_name in run_names:
-                    stats = runs[run_name]
-                    row += formatter(stats)
-                lines.append(row)
-            lines.append("")
-
-    return "\n".join(lines)
-
-
-def get_run_name(path: str) -> str:
-    """Extract a short run name from a path."""
-    p = Path(path).resolve()
-    # Use parent directory name if path ends with common tensorboard dir names
-    if p.name.lower() in ('tensorboard', 'logs', 'events'):
-        return p.parent.name
-    return p.name
+        lo, hi = '', s
+    try:
+        xmin = float(lo) if lo.strip() else None
+        xmax = float(hi) if hi.strip() else None
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid x-axis range {value!r}; expected MIN:MAX (e.g. 0:200)"
+        )
+    if xmin is not None and xmax is not None and xmin > xmax:
+        xmin, xmax = xmax, xmin
+    return xmin, xmax
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         'file',
         nargs='*',
         default=['-'],
-        help='Input file(s), TensorBoard log directory(s), or - for stdin',
+        help='Input file(s), or - for stdin',
     )
     parser.add_argument(
         '-p', '--pattern',
@@ -143,6 +80,14 @@ def main(argv: list[str] | None = None) -> int:
         dest='y_fields',
         action='append',
         help='Field(s)/tag(s) to plot (can be specified multiple times)',
+    )
+    parser.add_argument(
+        '--xlim', '--xrange',
+        dest='xlim',
+        type=parse_xlim,
+        metavar='MIN:MAX',
+        help='Restrict the x-axis to a range, e.g. --xlim 0:200, :200, or 1000: '
+             '(open-ended bounds allowed)',
     )
     parser.add_argument(
         '-w', '--width',
@@ -164,36 +109,51 @@ def main(argv: list[str] | None = None) -> int:
         help='Chart title',
     )
     parser.add_argument(
-        '--tensorboard', '--tb',
-        action='store_true',
-        help='Force TensorBoard mode (auto-detected if path contains tfevents)',
-    )
-    parser.add_argument(
         '--overlay',
         action='store_true',
-        help='Overlay all metrics on single chart (default for JSONL)',
+        help='Overlay all metrics on a single chart instead of one panel per metric',
+    )
+    layout_group = parser.add_mutually_exclusive_group()
+    layout_group.add_argument(
+        '-g', '--group-by',
+        dest='group_by',
+        help='One panel per y-field, one curve per distinct value of this field (e.g. -g gpu)',
+    )
+    layout_group.add_argument(
+        '--panel-by',
+        dest='panel_by',
+        help='One panel per distinct value of this field, y-fields as curves inside each panel',
     )
     parser.add_argument(
-        '--list-tags',
+        '-f', '--follow',
         action='store_true',
-        help='List available TensorBoard tags and exit',
+        help='Stream JSONL input and refresh the plot as new records arrive',
+    )
+    parser.add_argument(
+        '--window',
+        type=int,
+        default=1000,
+        help='Max records to retain in --follow mode (default: 1000)',
+    )
+    parser.add_argument(
+        '--refresh-ms',
+        dest='refresh_ms',
+        type=int,
+        default=200,
+        help='Refresh interval in milliseconds for --follow mode (default: 200)',
+    )
+    parser.add_argument(
+        '--columns', '--cols',
+        type=int,
+        default=1,
+        help='Arrange panels in N columns (default: 1, stacked vertically)',
     )
     parser.add_argument(
         '-s', '--smooth',
         type=float,
         default=0.0,
         metavar='WEIGHT',
-        help='Smoothing weight 0-1 (0=none, 0.9=heavy smoothing, like TensorBoard)',
-    )
-    parser.add_argument(
-        '--stats',
-        action='store_true',
-        help='Show statistics instead of graph (side-by-side table for multiple runs)',
-    )
-    parser.add_argument(
-        '--json',
-        action='store_true',
-        help='Output stats as JSON (use with --stats)',
+        help='Smoothing weight 0-1 (0=none, 0.9=heavy smoothing)',
     )
 
     args = parser.parse_args(argv)
@@ -221,113 +181,13 @@ def main(argv: list[str] | None = None) -> int:
     # Auto-size height: use ~60% of terminal height, minimum 15
     height = args.height if args.height else max(15, int(term_height * 0.6))
 
-    # Detect input type - check if any file is TensorBoard
-    is_tb = args.tensorboard or any(
-        is_tensorboard_dir(f) or is_tensorboard_file(f)
-        for f in files if f != '-'
-    )
-
     renderer = get_renderer(ascii_only=args.ascii)
 
-    if is_tb:
-        # TensorBoard mode - separate panels per metric by default
-        # Filter to only existing TensorBoard directories (exclude unexpanded globs)
-        tb_dirs = [
-            f for f in files
-            if f != '-'
-            and '*' not in f and '?' not in f and '[' not in f  # Skip unexpanded globs
-            and (is_tensorboard_dir(f) or is_tensorboard_file(f))
-        ]
-
-        if not tb_dirs:
-            print('No TensorBoard logs found', file=sys.stderr)
-            return 1
-
-        # Parse each directory and merge
-        all_panels = []
-        for f in tb_dirs:
-            try:
-                # Use directory name as run identifier when comparing multiple
-                run_name = get_run_name(f) if len(tb_dirs) > 1 else None
-                # For --list-tags, parse all tags (don't filter)
-                tags_to_parse = None if args.list_tags else args.y_fields
-                panels = parse_tensorboard(f, tags_to_parse, run_name=run_name)
-                all_panels.append(panels)
-            except ImportError as e:
-                print(f'Error: {e}', file=sys.stderr)
-                return 1
-            except Exception as e:
-                print(f'Error reading TensorBoard logs from {f}: {e}', file=sys.stderr)
-                return 1
-
-        if not all_panels:
-            print('No TensorBoard logs found', file=sys.stderr)
-            return 1
-
-        # Merge all panels
-        panels = merge_tensorboard_panels(*all_panels)
-
-        # Apply smoothing if requested
-        if args.smooth > 0:
-            for tag in panels:
-                for run_name in panels[tag]:
-                    steps, values = panels[tag][run_name]
-                    panels[tag][run_name] = (steps, smooth_values(values, args.smooth))
-
-        # If --list-tags, just print available tags and exit
-        if args.list_tags:
-            print('Available tags:')
-            for tag in sorted(panels.keys()):
-                runs = list(panels[tag].keys())
-                print(f'  {tag}  ({len(runs)} run{"s" if len(runs) > 1 else ""})')
-            return 0
-
-        if not panels:
-            print('No scalar data found in TensorBoard logs', file=sys.stderr)
-            return 1
-
-        # Stats mode - show statistics instead of graph
-        if args.stats:
-            all_stats = {}
-            for tag, runs in panels.items():
-                all_stats[tag] = {}
-                for run_name, (steps, values) in runs.items():
-                    all_stats[tag][run_name] = compute_stats(steps, values)
-
-            if args.json:
-                print(json_module.dumps(all_stats, indent=2))
-            else:
-                print(format_stats_table(all_stats))
-            return 0
-
-        if args.overlay:
-            # Flatten to single chart overlay mode
-            chart = LineChart(title=args.title or '', x_label='step')
-            for tag, runs in panels.items():
-                for run_name, (steps, values) in runs.items():
-                    label = f"{tag}" if run_name == 'default' else f"{tag}/{run_name}"
-                    chart.add_series(label, steps, values)
-            output = renderer.render(chart, width, height)
-        else:
-            # Separate panels per metric (TensorBoard style)
-            from .renderers.plotext_renderer import PlotextRenderer
-            if isinstance(renderer, PlotextRenderer):
-                output = renderer.render_panels(panels, width, height, x_label='step')
-            else:
-                # Fallback for ASCII renderer - just render each separately
-                outputs = []
-                for tag, runs in panels.items():
-                    chart = LineChart(title=tag, x_label='step')
-                    for run_name, (steps, values) in runs.items():
-                        chart.add_series(run_name, steps, values)
-                    outputs.append(renderer.render(chart, width, height))
-                output = '\n'.join(outputs)
-
-        print(output)
-        return 0
-
-    # JSONL mode - overlay by default (use first file only)
+    # JSONL mode (use first file only)
     input_file = files[0]
+    if args.follow:
+        return run_follow(args, input_file, width, height, renderer)
+
     try:
         records = list(parse_jsonl(input_file, args.pattern))
     except FileNotFoundError:
@@ -340,37 +200,148 @@ def main(argv: list[str] | None = None) -> int:
         print('No matching records found', file=sys.stderr)
         return 1
 
-    # Detect or use specified x-axis
     x_axis = args.x_axis or detect_x_axis(records)
     if not x_axis:
         print('Error: Could not detect x-axis field. Use -x to specify.', file=sys.stderr)
         return 1
 
-    # Extract series
-    series_data = extract_series(records, x_axis, args.y_fields)
-    if not series_data:
+    output = render_jsonl(records, x_axis, args, width, height, renderer)
+    if output is None:
         print('Error: No numeric data found to plot', file=sys.stderr)
         return 1
+    print(output)
+    return 0
 
-    # Apply smoothing if requested
+
+def render_jsonl(records, x_axis, args, width, height, renderer) -> str | None:
+    """Render a list of JSONL records to a string. Returns None on no data."""
+    import math as _math
+
+    from .renderers.plotext_renderer import PlotextRenderer
+
+    columns = max(1, getattr(args, 'columns', 1))
+
+    if args.group_by or args.panel_by:
+        if args.group_by:
+            panels = extract_grouped_series(records, x_axis, args.y_fields, args.group_by)
+        else:
+            panels = extract_paneled_series(records, x_axis, args.y_fields, args.panel_by)
+        if args.xlim:
+            panels = clip_x_range(panels, *args.xlim)
+        if not panels:
+            return None
+        if args.smooth > 0:
+            for tag in panels:
+                for run in panels[tag]:
+                    xs, ys = panels[tag][run]
+                    panels[tag][run] = (xs, smooth_values(ys, args.smooth))
+
+        # Auto-fit per-panel height for grid layout when -H wasn't specified
+        panel_height = height
+        if columns > 1 and not args.height:
+            _, term_h = get_terminal_size()
+            rows = _math.ceil(len(panels) / columns)
+            panel_height = max(7, (term_h - 2) // max(rows, 1))
+
+        if isinstance(renderer, PlotextRenderer):
+            return renderer.render_panels(panels, width, panel_height, x_label=x_axis, columns=columns)
+        outputs = []
+        for tag, runs in panels.items():
+            chart = LineChart(title=tag, x_label=x_axis)
+            for run_name, (xs, ys) in runs.items():
+                chart.add_series(run_name, xs, ys)
+            outputs.append(renderer.render(chart, width, panel_height))
+        return '\n'.join(outputs)
+
+    series_data = extract_series(records, x_axis, args.y_fields)
+    if args.xlim:
+        series_data = clip_x_range(series_data, *args.xlim)
+    if not series_data:
+        return None
     if args.smooth > 0:
         for name in series_data:
-            x_vals, y_vals = series_data[name]
-            series_data[name] = (x_vals, smooth_values(y_vals, args.smooth))
+            xs, ys = series_data[name]
+            series_data[name] = (xs, smooth_values(ys, args.smooth))
 
-    # Build chart
-    chart = LineChart(
-        title=args.title or '',
-        x_label=x_axis,
-    )
-    for name, (x_vals, y_vals) in series_data.items():
-        chart.add_series(name, x_vals, y_vals)
+    if args.overlay or len(series_data) == 1:
+        chart = LineChart(title=args.title or '', x_label=x_axis)
+        for name, (xs, ys) in series_data.items():
+            chart.add_series(name, xs, ys)
+        return renderer.render(chart, width, height)
 
-    # Render
-    output = renderer.render(chart, width, height)
-    print(output)
+    panels = {name: {'default': (xs, ys)} for name, (xs, ys) in series_data.items()}
+    panel_height = height
+    if columns > 1 and not args.height:
+        _, term_h = get_terminal_size()
+        rows = _math.ceil(len(panels) / columns)
+        panel_height = max(7, (term_h - 2) // max(rows, 1))
+    if isinstance(renderer, PlotextRenderer):
+        return renderer.render_panels(panels, width, panel_height, x_label=x_axis, columns=columns)
+    outputs = []
+    for name, (xs, ys) in series_data.items():
+        chart = LineChart(title=name, x_label=x_axis)
+        chart.add_series(name, xs, ys)
+        outputs.append(renderer.render(chart, width, panel_height))
+    return '\n'.join(outputs)
 
-    return 0
+
+def run_follow(args, input_file, width, height, renderer) -> int:
+    """Stream JSONL from input_file, keep a bounded window, re-render on a timer."""
+    buffer: deque = deque(maxlen=max(1, args.window))
+    lock = threading.Lock()
+    stop = threading.Event()
+    reader_done = threading.Event()
+
+    def reader():
+        try:
+            for rec in parse_jsonl(input_file, args.pattern):
+                if stop.is_set():
+                    return
+                with lock:
+                    buffer.append(rec)
+        except FileNotFoundError:
+            sys.stderr.write(f'Error: File not found: {input_file}\n')
+        except Exception as e:
+            sys.stderr.write(f'reader error: {e}\n')
+        finally:
+            reader_done.set()
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
+    refresh_s = max(0.02, args.refresh_ms / 1000.0)
+    x_axis = args.x_axis
+    sys.stdout.write('\x1b[?25l')  # hide cursor
+    sys.stdout.flush()
+
+    try:
+        while True:
+            with lock:
+                snapshot = list(buffer)
+
+            if snapshot:
+                if not x_axis:
+                    x_axis = detect_x_axis(snapshot)
+                if x_axis:
+                    output = render_jsonl(snapshot, x_axis, args, width, height, renderer)
+                    if output is not None:
+                        sys.stdout.write('\x1b[H\x1b[J')  # cursor home + clear to end
+                        sys.stdout.write(output)
+                        sys.stdout.write('\n')
+                        sys.stdout.flush()
+
+            if reader_done.is_set() and not snapshot:
+                # Input closed and nothing was ever buffered
+                sys.stderr.write('No matching records found\n')
+                return 1
+
+            time.sleep(refresh_s)
+    except KeyboardInterrupt:
+        stop.set()
+        return 0
+    finally:
+        sys.stdout.write('\x1b[?25h')  # show cursor
+        sys.stdout.flush()
 
 
 if __name__ == '__main__':
